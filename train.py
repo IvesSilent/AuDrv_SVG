@@ -28,6 +28,7 @@ def train(generator, discriminator, train_loader, val_loader, criterion_L1, opti
         last_epoch = num_old_epoch
     else:
         last_epoch = 0
+    final_save_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     for epoch in range(num_epochs):
         generator.train()
@@ -50,18 +51,17 @@ def train(generator, discriminator, train_loader, val_loader, criterion_L1, opti
                 audio_frame = audio[:, frame_idx, :]
                 face_frame = video[:, frame_idx, :]
                 real_frame = video[:, frame_idx + 1, :]
-                gen_frame = generator(audio_frame, face_frame).detach()  # 分离梯度，不更新G
+                with torch.no_grad():
+                    gen_frame = generator(audio_frame, face_frame)  # detach: 不更新G
 
-                # D判断真帧
+                # D判断真帧 (real_frame=real_frame → delta=0 → 判真)
                 d_real = discriminator(audio_frame, face_frame, real_frame, real_frame)
-                # D判断假帧
+                # D判断假帧 (real vs gen → delta≠0 → 判假)
                 d_fake = discriminator(audio_frame, face_frame, gen_frame, real_frame)
 
-                # hinge loss
-                loss_D = torch.mean(F.relu(1.0 - d_real)) + torch.mean(F.relu(1.0 + d_fake))
+                # BCE loss（D输出是sigmoid，值域[0,1]）
+                loss_D = -torch.log(d_real + 1e-8).mean() - torch.log(1.0 - d_fake + 1e-8).mean()
 
-            scaler_D = scaler if False else GradScaler()  # 复用已有的scaler
-            # 用同一个scaler
             scaler.scale(loss_D).backward()
             scaler.step(optimizer_D)
             scaler.update()
@@ -160,11 +160,12 @@ def train(generator, discriminator, train_loader, val_loader, criterion_L1, opti
         val_psnres.append(avg_val_psnr)
 
         # 早停机制
-        if val_loss < min_loss:
-            min_loss = val_loss
+        save_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        if avg_val_loss < min_loss:
+            min_loss = avg_val_loss
             early_stop_count = 0
             # 保存模型
-            current_time = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            current_time = save_time
 
             if pretrain:
                 best_generator_path = os.path.join(save_dir,
@@ -190,11 +191,10 @@ def train(generator, discriminator, train_loader, val_loader, criterion_L1, opti
         last_epoch += 1
 
     generator_save_path = os.path.join(save_dir,
-                                       f'model_generator_epoch_{last_epoch + 1}_{current_time}.pth')
+                                       f'model_generator_final_{last_epoch + 1}_{final_save_time}.pth')
     discriminator_save_path = os.path.join(save_dir,
-                                           f'model_discriminator_epoch_{last_epoch + 1}_{current_time}.pth')
+                                           f'model_discriminator_final_{last_epoch + 1}_{final_save_time}.pth')
     os.makedirs(os.path.dirname(generator_save_path), exist_ok=True)
-    os.makedirs(os.path.dirname(discriminator_save_path), exist_ok=True)
     torch.save(generator.state_dict(), generator_save_path)
     torch.save(discriminator.state_dict(), discriminator_save_path)
     print(f"\t{last_epoch}ep 训练完成")
