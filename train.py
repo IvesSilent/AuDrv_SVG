@@ -356,10 +356,12 @@ if __name__ == "__main__":
     criterion_L1 = nn.L1Loss()
 
     # 优化器
-    optimizer_G = optim.Adam(generator.parameters(), lr=lr)
+    optimizer_G = optim.Adam(generator.parameters(), lr=lr, weight_decay=1e-5)
+    optimizer_D = optim.Adam(discriminator.parameters(), lr=lr * 0.5, weight_decay=1e-5)
 
     # 学习率调度器
     scheduler_G = CosineAnnealingLR(optimizer_G, T_max=100, eta_min=0.00001)
+    scheduler_D = CosineAnnealingLR(optimizer_D, T_max=100, eta_min=0.00001)
 
     # 创建GradScaler
     scaler = GradScaler()
@@ -381,8 +383,9 @@ if __name__ == "__main__":
 
     # 训练
     train(generator, discriminator, train_loader, val_loader, criterion_L1, optimizer_G,
-          scheduler_G, scaler, lambda_l1, num_epochs, pretrain, num_old_epoch, save_dir,
-          min_loss, train_losses, val_losses, early_stop_count, ssim_metric, psnr_metric, val_ssimes, val_psnres)
+          optimizer_D, scheduler_G, scheduler_D, scaler, lambda_l1, num_epochs, pretrain,
+          num_old_epoch, save_dir, min_loss, train_losses, val_losses, early_stop_count,
+          ssim_metric, psnr_metric, val_ssimes, val_psnres)
 
     # ##############################################################################
     # Phase_4 - 训练结果可视化
@@ -404,14 +407,11 @@ if __name__ == "__main__":
     plt.title('Training and Validation Loss')
     plt.legend()
 
+    os.makedirs('Result_Fig', exist_ok=True)
     plt_dir = f'Result_Fig/loss_plot_epoch_{num_epochs}_{current_time}.png'
-    if not os.path.exists(plt_dir):
-        os.makedirs(plt_dir)
     plt.savefig(plt_dir)
+    print(f"训练数据可视化已保存: {plt_dir}")
 
-    print(f"训练数据可视化保存至 {plt_dir} 目录")
-
-    # 绘制评估指标图
     plt.figure(figsize=(10, 5))
     plt.plot(val_ssimes, label='SSIM Score')
     plt.plot(val_psnres, label='PSNR Score')
@@ -421,12 +421,8 @@ if __name__ == "__main__":
     plt.legend()
 
     plt_dir_2 = f'Result_Fig/SSIM-PSNR_plot_epoch_{num_epochs}_{current_time}.png'
-    if not os.path.exists(plt_dir_2):
-        os.makedirs(plt_dir_2)
     plt.savefig(plt_dir_2)
-    plt.show()
-
-    print(f"训练评估指标保存至 {plt_dir_2} 目录")
+    print(f"验证评估指标已保存: {plt_dir_2}")
 
 
 
