@@ -1,4 +1,4 @@
-# -*coding=utf-8*-
+# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import os
@@ -30,7 +30,7 @@ def test(generator, test_loader, device, save_dir):
 
             # 保存生成的视频
             for k in range(batch_size):
-                video_path = os.path.join(save_dir, f'result_{i * batch_size + k}.mp4')
+                video_path = os.path.join(save_dir, f'result_{batch_idx * batch_size + k}.mp4')
                 video_writer = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*'mp4v'), 25, (256, 256))
                 for frame in generated_video[k]:
                     frame = frame.permute(1, 2, 0).cpu().numpy() * 255

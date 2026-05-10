@@ -96,10 +96,9 @@ class AudioVideoDataset(Dataset):
                     indices.append(i * audio_interval + remaining_audio_frames)
             mel_spect = mel_spect[:, indices]
         else:
-            # 如果音频帧数小于等于视频帧数，则直接使用音频帧
-            mel_spect = mel_spect.permute(1, 0)  # 调整音频帧的维度
-
-        mel_spect = mel_spect.permute(1, 0)
+            # 音频帧数 <= 视频帧数：保持 (n_mels, time_steps)
+            pass
+        mel_spect = mel_spect.permute(1, 0)  # → (time_steps, n_mels)
         audio_length = mel_spect.shape[0]
         video_frames = torch.stack(video_frames)
 

@@ -1,4 +1,4 @@
-# -*coding=utf-8*-
+# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,141 +16,148 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from torch.cuda.amp import autocast, GradScaler
 import torchmetrics
+import numpy as np
 
 
 # 训练函数
 def train(generator, discriminator, train_loader, val_loader, criterion_L1, optimizer_G,
-          scheduler_G, scaler, lambda_l1, num_epochs, pretrain, num_old_epoch, save_dir,
-          min_loss, train_losses, val_losses, early_stop_count, ssim_metric, psnr_metric, val_ssimes, val_psnres):
+          optimizer_D, scheduler_G, scheduler_D, scaler, lambda_l1, num_epochs, pretrain,
+          num_old_epoch, save_dir, min_loss, train_losses, val_losses, early_stop_count,
+          ssim_metric, psnr_metric, val_ssimes, val_psnres):
     if pretrain:
         last_epoch = num_old_epoch
     else:
         last_epoch = 0
 
-    # 训练循环
     for epoch in range(num_epochs):
         generator.train()
         discriminator.train()
 
-        train_loss = 0
-        # 使用tqdm进度条
+        epoch_train_loss = 0.0
         tqdm_bar_train = tqdm(enumerate(train_loader), total=len(train_loader),
                               desc=f'Epoch {epoch + 1}/{num_epochs} Training')
-        for i, data in tqdm_bar_train:
+        for batch_idx, data in tqdm_bar_train:
             audio, video = data['audio'].to(device), data['video'].to(device)
-
             batch_size = video.shape[0]
             sample_length = video.shape[1]
 
+            # ── 先训练判别器 ──
+            optimizer_D.zero_grad()
             optimizer_G.zero_grad()
+            with autocast():
+                # 随机采样一个帧位置
+                frame_idx = np.random.randint(0, sample_length - 1) if sample_length > 1 else 0
+                audio_frame = audio[:, frame_idx, :]
+                face_frame = video[:, frame_idx, :]
+                real_frame = video[:, frame_idx + 1, :]
+                gen_frame = generator(audio_frame, face_frame).detach()  # 分离梯度，不更新G
 
-            # 【优化项】使用混合精度训练
-            # 将autocast上下文管理器应用于模型的前向传播，以自动将计算转换为半精度
-            with autocast():  # 启用自动混合精度
+                # D判断真帧
+                d_real = discriminator(audio_frame, face_frame, real_frame, real_frame)
+                # D判断假帧
+                d_fake = discriminator(audio_frame, face_frame, gen_frame, real_frame)
 
-                # 初始化生成视频帧序列
+                # hinge loss
+                loss_D = torch.mean(F.relu(1.0 - d_real)) + torch.mean(F.relu(1.0 + d_fake))
+
+            scaler_D = scaler if False else GradScaler()  # 复用已有的scaler
+            # 用同一个scaler
+            scaler.scale(loss_D).backward()
+            scaler.step(optimizer_D)
+            scaler.update()
+
+            # ── 训练生成器（自回归生成完整序列） ──
+            optimizer_G.zero_grad()
+            with autocast():
                 generated_video = torch.zeros(batch_size, sample_length, video.shape[2], video.shape[3],
                                               video.shape[4]).to(device)
-                generated_video[:, 0, :, :, :] = video[:, 0, :, :, :]  # 第一帧同样本第一帧
-                y_disc = torch.zeros(batch_size, sample_length - 1).to(device)  # 初始化判别概率
-                for i in range(sample_length - 1):
-                    audio_frame = audio[:, i, :]  # 获取当前帧音频切片
-                    face_frame = video[:, i, :]  # 获取当前帧视频切片
-                    gen_frame = generator(audio_frame, face_frame)  # 生成下一帧
-                    # 将生成的帧放入 generated_video 中
-                    generated_video[:, i + 1, :, :, :] = gen_frame  # 保存生成的帧
+                generated_video[:, 0, :, :, :] = video[:, 0, :, :, :]
+                y_disc = torch.zeros(batch_size, sample_length - 1).to(device)
+                for t in range(sample_length - 1):
+                    audio_frame_t = audio[:, t, :]
+                    face_frame_t = video[:, t, :]
+                    gen_frame_t = generator(audio_frame_t, face_frame_t)
+                    generated_video[:, t + 1, :, :, :] = gen_frame_t
 
-                    # 判别器对生成样本的判断结果
-                    disc_output_gen = discriminator(audio_frame, face_frame, gen_frame, gen_frame)
-                    y_disc[:, i] = disc_output_gen.squeeze()
+                    real_frame_t = video[:, t + 1, :]
+                    disc_out = discriminator(audio_frame_t, face_frame_t, gen_frame_t, real_frame_t)
+                    y_disc[:, t] = disc_out.squeeze()
 
-                # 计算对抗损失
-                loss_adv = -torch.log(y_disc).mean()
-                # 计算L1损失
+                loss_adv = -torch.log(y_disc + 1e-8).mean()
                 loss_l1 = criterion_L1(generated_video, video)
-                # 总损失
-                loss_G = loss_adv + lambda_l1 * loss_l1  # lambda_l1是L1损失的权重
+                loss_G = loss_adv + lambda_l1 * loss_l1
 
-            # 反向传播和优化
-            scaler.scale(loss_G).backward()  # 放大梯度
-            scaler.step(optimizer_G)  # 更新参数
-            scaler.update()  # 更新缩放因子
-            optimizer_G.zero_grad()
+            scaler.scale(loss_G).backward()
+            scaler.step(optimizer_G)
+            scaler.update()
 
-            tqdm_bar_train.set_postfix(loss=loss_G.item())
+            epoch_train_loss += loss_G.item()
+            tqdm_bar_train.set_postfix(loss_G=loss_G.item(), loss_D=loss_D.item())
 
-        # 验证循环
-        val_loss = 0
-        val_ssim = 0
-        val_psnr = 0
+        # ── 验证 ──
+        epoch_val_loss = 0.0
+        epoch_val_ssim = 0.0
+        epoch_val_psnr = 0.0
+        val_batch_count = 0
 
         generator.eval()
         discriminator.eval()
         with torch.no_grad():
             tqdm_bar_val = tqdm(enumerate(val_loader), total=len(val_loader),
                                 desc=f'Epoch {epoch + 1}/{num_epochs} Validation')
-            for i, data in tqdm_bar_val:
+            for batch_idx, data in tqdm_bar_val:
                 audio, video = data['audio'].to(device), data['video'].to(device)
-
                 batch_size = video.shape[0]
                 sample_length = video.shape[1]
 
-                # 生成器验证
-                # 初始化生成视频帧序列
                 generated_video = torch.zeros(batch_size, sample_length, video.shape[2], video.shape[3],
                                               video.shape[4]).to(device)
-                generated_video[:, 0, :, :, :] = video[:, 0, :, :, :]  # 第一帧同样本第一帧
+                generated_video[:, 0, :, :, :] = video[:, 0, :, :, :]
 
-                # 初始化判别概率
-                y_disc = torch.zeros(batch_size, sample_length - 1).to(
-                    device)  # 初始化判别概率, 尺寸(batch_size, sample_length - 1)
-                # y_fact = torch.zeros(batch_size, sample_length - 1).to(
-                # device)  # 判别标签为0, 尺寸(batch_size, sample_length - 1)
+                batch_ssim = 0.0
+                batch_psnr = 0.0
+                y_disc = torch.zeros(batch_size, sample_length - 1).to(device)
 
-                for i in range(sample_length - 1):
-                    audio_frame = audio[:, i, :]  # 获取当前帧音频切片
-                    face_frame = video[:, i, :]  # 获取当前帧视频切片
-                    gen_frame = generator(audio_frame, face_frame)  # 生成下一帧
-                    # 将生成的帧放入 generated_video 中
-                    generated_video[:, i + 1, :, :, :] = gen_frame  # 保存生成的帧
+                for t in range(sample_length - 1):
+                    audio_frame = audio[:, t, :]
+                    face_frame = video[:, t, :]
+                    gen_frame = generator(audio_frame, face_frame)
+                    generated_video[:, t + 1, :, :, :] = gen_frame
 
-                    real_frame = audio[:, i, :]  # 获取真实的下一帧视频切片
-                    disc_output = discriminator(audio_frame, face_frame, gen_frame, real_frame)  # (batch_size,1)
-                    y_disc[:, i] = disc_output
+                    real_frame = video[:, t + 1, :]
+                    disc_output = discriminator(audio_frame, face_frame, gen_frame, real_frame)
+                    y_disc[:, t] = disc_output.squeeze()
 
-                    ssim_value = ssim_metric(gen_frame, video[:, i + 1, :])
-                    psnr_value = psnr_metric(gen_frame, video[:, i + 1, :])
-                    val_ssim += ssim_value.item()
-                    val_psnr += psnr_value.item()
+                    ssim_value = ssim_metric(gen_frame, video[:, t + 1, :])
+                    psnr_value = psnr_metric(gen_frame, video[:, t + 1, :])
+                    batch_ssim += ssim_value.item()
+                    batch_psnr += psnr_value.item()
 
-                # 计算对抗损失
-                loss_adv = -torch.log(y_disc).mean()
-                # 计算L1损失
+                loss_adv = -torch.log(y_disc + 1e-8).mean()
                 loss_l1 = criterion_L1(generated_video, video)
-                # 总损失
-                loss_G = loss_adv + lambda_l1 * loss_l1  # lambda_l1是L1损失的权重
+                loss_G = loss_adv + lambda_l1 * loss_l1
 
-                val_loss += loss_G.item()
-
-                # 计算平均SSIM和PSNR
-                avg_ssim = val_ssim / (sample_length - 1)
-                avg_psnr = val_psnr / (sample_length - 1)
-
-                # 存储评估指标
-                val_ssimes.append(avg_ssim)
-                val_psnres.append(avg_psnr)
+                epoch_val_loss += loss_G.item()
+                epoch_val_ssim += batch_ssim / (sample_length - 1)
+                epoch_val_psnr += batch_psnr / (sample_length - 1)
+                val_batch_count += 1
 
                 tqdm_bar_val.set_postfix(loss=loss_G.item())
 
-        # 学习率调度
+        # ── epoch 汇总 ──
         scheduler_G.step()
-        # scheduler_D.step()
+        if scheduler_D:
+            scheduler_D.step()
 
-        train_loss = train_loss / len(train_loader)
-        val_loss = val_loss / len(val_loader)
+        avg_train_loss = epoch_train_loss / len(train_loader)
+        avg_val_loss = epoch_val_loss / len(val_loader)
+        avg_val_ssim = epoch_val_ssim / max(val_batch_count, 1)
+        avg_val_psnr = epoch_val_psnr / max(val_batch_count, 1)
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
+        val_ssimes.append(avg_val_ssim)
+        val_psnres.append(avg_val_psnr)
 
         # 早停机制
         if val_loss < min_loss:
